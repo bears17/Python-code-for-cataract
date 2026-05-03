@@ -1,0 +1,461 @@
+"""
+Eye Abnormality Screening - CNN Transfer Learning Model
+Based on thesis: Early Eye Abnormality Screening System for Rural Health Centers
+n
+"""
+
+import os
+import random
+
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import callbacks, layers, models, optimizers
+from tensorflow.keras.applications import EfficientNetB0, InceptionV3, ResNet50
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, roc_curve
+import matplotlib.pyplot as plt
+import json
+
+# ─────────────────────────────────────────────
+# REPRODUCIBILITY
+# ─────────────────────────────────────────────
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+
+# Backbone-specific settings kept here so CONFIG stays the single source of truth.
+_BACKBONE_LAYER_NAMES = {
+    "EfficientNetB0": "efficientnetb0",
+    "ResNet50": "resnet50",
+    "InceptionV3": "inception_v3",
+}
+
+_BACKBONE_INPUT_SIZES = {
+    "EfficientNetB0": (224, 224),
+    "ResNet50":       (224, 224),
+    "InceptionV3":    (299, 299),   # InceptionV3 was trained on 299×299
+}
+
+_BACKBONE_PREPROCESS = {
+    "EfficientNetB0": tf.keras.applications.efficientnet.preprocess_input,
+    "ResNet50":       tf.keras.applications.resnet.preprocess_input,
+    "InceptionV3":    tf.keras.applications.inception_v3.preprocess_input,
+}
+
+BACKBONE: str = "EfficientNetB0"   # EfficientNetB0 | ResNet50 | InceptionV3
+
+CONFIG = {
+    "image_size":       _BACKBONE_INPUT_SIZES[BACKBONE],
+    "batch_size":       32,
+    "epochs":           30,
+    "learning_rate":    1e-4,
+    "fine_tune_lr":     1e-5,
+    "fine_tune_at":     100,        # unfreeze backbone layers from this index onward
+    "fine_tune_epochs": 10,
+    "dropout_rate":     0.4,
+    "num_classes":      2,          # Normal / Needs Referral
+    "class_names":      ["Normal", "Needs Referral"],
+    "backbone":         BACKBONE,
+    "model_dir":        "models",
+    "model_save_path":  "models/eye_screening_phase1.keras",
+    "ft_save_path":     "models/eye_screening_phase2.keras",
+    "metrics_save_path":"models/metrics.json",
+}
+
+# ─────────────────────────────────────────────
+# DATA PIPELINE
+# ─────────────────────────────────────────────
+
+def build_data_generators(train_dir: str, val_dir: str, test_dir: str):
+    """
+    Build augmented training, validation, and test data generators.
+    Rescaling is set to 1.0 (identity) because each backbone's own
+    preprocessing function is applied inside the model graph, making
+    the exported model portable and removing a hidden preprocessing mismatch.
+
+    Compatible datasets: Kaggle DR, MESSIDOR, RIM-ONE, ORIGA, etc.
+    """
+    train_aug = ImageDataGenerator(
+        rescale=1.0,                # preprocessing done inside model
+        rotation_range=20,
+        width_shift_range=0.1,
+        height_shift_range=0.1,
+        shear_range=0.1,
+        zoom_range=0.15,
+        horizontal_flip=True,
+        vertical_flip=False,
+        brightness_range=[0.8, 1.2],
+        fill_mode="nearest",
+    )
+    eval_aug = ImageDataGenerator(rescale=1.0)
+
+    img_size = CONFIG["image_size"]
+    batch    = CONFIG["batch_size"]
+
+    def _flow(gen, directory, shuffle):
+        return gen.flow_from_directory(
+            directory,
+            target_size=img_size,
+            batch_size=batch,
+            class_mode="categorical",
+            shuffle=shuffle,
+            seed=SEED,
+        )
+
+    train_gen = _flow(train_aug, train_dir, shuffle=True)
+    val_gen   = _flow(eval_aug,  val_dir,   shuffle=False)
+    test_gen  = _flow(eval_aug,  test_dir,  shuffle=False)
+
+    return train_gen, val_gen, test_gen
+
+
+# ─────────────────────────────────────────────
+# MODEL BUILDER
+# ─────────────────────────────────────────────
+
+def _get_backbone(name: str, input_shape: tuple) -> tf.keras.Model:
+    """Return a frozen pre-trained backbone."""
+    backbone_cls = {"EfficientNetB0": EfficientNetB0,
+                    "ResNet50":       ResNet50,
+                    "InceptionV3":    InceptionV3}[name]
+    backbone = backbone_cls(weights="imagenet", include_top=False,
+                            input_shape=input_shape)
+    backbone.trainable = False
+    return backbone
+
+
+def build_model() -> tf.keras.Model:
+    """
+    Transfer-learning model:
+      Backbone-specific preprocess → Backbone (frozen) →
+      GlobalAveragePooling → BN → Dense(256) → Dropout →
+      Dense(128) → Dropout → Dense(2, softmax)
+
+    The preprocessing function for the chosen backbone is embedded as
+    the first layer so the model is self-contained for inference and export.
+
+    Sensitivity-optimised: class weights in training give the
+    'Needs Referral' class higher penalty for missed detections.
+    """
+    img_h, img_w = CONFIG["image_size"]
+    input_shape  = (img_h, img_w, 3)
+    preprocess_fn = _BACKBONE_PREPROCESS[CONFIG["backbone"]]
+
+    backbone = _get_backbone(CONFIG["backbone"], input_shape)
+
+    inputs = tf.keras.Input(shape=input_shape, name="fundus_image")
+    # Embed backbone preprocessing inside the graph (no rescale in generator)
+    x = layers.Lambda(preprocess_fn, name="backbone_preprocess")(inputs)
+    x = backbone(x, training=False)
+    x = layers.GlobalAveragePooling2D(name="gap")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dense(256, activation="relu", name="fc1")(x)
+    x = layers.Dropout(CONFIG["dropout_rate"])(x)
+    x = layers.Dense(128, activation="relu", name="fc2")(x)
+    x = layers.Dropout(CONFIG["dropout_rate"] / 2)(x)
+    outputs = layers.Dense(CONFIG["num_classes"], activation="softmax",
+                           name="predictions")(x)
+
+    return models.Model(inputs, outputs, name="EyeScreeningCNN")
+
+
+def compile_model(model: tf.keras.Model, lr: float = None) -> tf.keras.Model:
+    """Compile and return the model (in-place + return for chaining)."""
+    lr = lr or CONFIG["learning_rate"]
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=lr),
+        loss="categorical_crossentropy",
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),              # ROC-AUC
+            tf.keras.metrics.AUC(name="pr_auc", curve="PR"),  # PR-AUC (imbalanced)
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),         # = Sensitivity
+        ],
+    )
+    return model
+
+
+# ─────────────────────────────────────────────
+# TRAINING
+# ─────────────────────────────────────────────
+
+def get_callbacks(monitor: str = "val_auc", save_path: str = None) -> list:
+    os.makedirs(CONFIG["model_dir"], exist_ok=True)
+    save_path = save_path or CONFIG["model_save_path"]
+    return [
+        callbacks.ModelCheckpoint(
+            save_path,
+            monitor=monitor,
+            mode="max",
+            save_best_only=True,
+            verbose=1,
+        ),
+        callbacks.EarlyStopping(
+            monitor=monitor,
+            patience=7,
+            mode="max",
+            restore_best_weights=True,
+            verbose=1,
+        ),
+        callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.3,
+            patience=3,
+            min_lr=1e-7,
+            verbose=1,
+        ),
+        callbacks.CSVLogger(os.path.join(CONFIG["model_dir"], "training_log.csv")),
+    ]
+
+
+def compute_class_weights(train_gen) -> dict:
+    """
+    Inverse-frequency class weights with an additional boost for 'Needs Referral'
+    to maximise sensitivity (err on the side of caution for a screening tool).
+    The 1.5× multiplier is a starting point — tune as a hyperparameter.
+    """
+    counts = np.bincount(train_gen.classes)
+    total  = counts.sum()
+    weights = {i: total / (len(counts) * c) for i, c in enumerate(counts)}
+    weights[1] *= 1.5   # boost 'Needs Referral' — adjust via ablation
+    print(f"Class weights: {weights}")
+    return weights
+
+
+def train(train_dir: str, val_dir: str, test_dir: str):
+    """
+    Phase 1: train classification head with frozen backbone.
+    Phase 2: fine-tune upper backbone layers with a lower learning rate.
+    Returns the final model and both history objects.
+    """
+    train_gen, val_gen, _ = build_data_generators(train_dir, val_dir, test_dir)
+
+    model = compile_model(build_model())
+    model.summary()
+
+    class_weights  = compute_class_weights(train_gen)
+    steps_per_epoch = len(train_gen)
+
+    # ── Phase 1: train top layers ─────────────────────────────────────────
+    print("\n── Phase 1: Training top layers ──")
+    history = model.fit(
+        train_gen,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_gen,
+        epochs=CONFIG["epochs"],
+        callbacks=get_callbacks(save_path=CONFIG["model_save_path"]),
+        class_weight=class_weights,
+    )
+
+    # ── Phase 2: fine-tune backbone ───────────────────────────────────────
+    print("\n── Phase 2: Fine-tuning backbone ──")
+    backbone_layer = model.get_layer(_BACKBONE_LAYER_NAMES[CONFIG["backbone"]])
+    backbone_layer.trainable = True
+    for layer in backbone_layer.layers[: CONFIG["fine_tune_at"]]:
+        layer.trainable = False
+
+    compile_model(model, lr=CONFIG["fine_tune_lr"])
+
+    fine_tune_history = model.fit(
+        train_gen,
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_gen,
+        epochs=CONFIG["fine_tune_epochs"],
+        # Separate save path so phase-1 best weights are never overwritten
+        callbacks=get_callbacks(save_path=CONFIG["ft_save_path"]),
+        class_weight=class_weights,
+    )
+
+    return model, history, fine_tune_history
+
+
+# ─────────────────────────────────────────────
+# EVALUATION
+# ─────────────────────────────────────────────
+
+def evaluate(model: tf.keras.Model, test_gen) -> dict:
+    """Full evaluation: accuracy, sensitivity, specificity, AUC (ROC + PR)."""
+    print("\n── Evaluating on test set ──")
+    y_true       = test_gen.classes
+    y_pred_proba = model.predict(test_gen, verbose=1)
+    y_pred       = np.argmax(y_pred_proba, axis=1)
+
+    report = classification_report(
+        y_true, y_pred,
+        target_names=CONFIG["class_names"],
+        output_dict=True,
+    )
+
+    cm = confusion_matrix(y_true, y_pred)
+    tn, fp, fn, tp = cm.ravel()
+
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    roc_auc     = roc_auc_score(y_true, y_pred_proba[:, 1])
+
+    metrics = {
+        "accuracy":    round(float(report["accuracy"]), 4),
+        "sensitivity": round(sensitivity, 4),
+        "specificity": round(specificity, 4),
+        "precision":   round(float(report["Needs Referral"]["precision"]), 4),
+        "f1_score":    round(float(report["Needs Referral"]["f1-score"]), 4),
+        "auc_roc":     round(roc_auc, 4),
+        # Named keys make the JSON self-documenting for the thesis appendix
+        "confusion_matrix": {
+            "TP": int(tp), "FP": int(fp),
+            "FN": int(fn), "TN": int(tn),
+        },
+    }
+
+    print("\n═══════════════════════════════════")
+    print(" EYE SCREENING MODEL — TEST RESULTS")
+    print("═══════════════════════════════════")
+    for k, v in metrics.items():
+        if k != "confusion_matrix":
+            print(f"  {k:<18}: {v}")
+    print(f"\n  Confusion Matrix (TP={tp} FP={fp} FN={fn} TN={tn})")
+    print("═══════════════════════════════════\n")
+
+    with open(CONFIG["metrics_save_path"], "w") as f:
+        json.dump(metrics, f, indent=2)
+    print(f"Metrics saved → {CONFIG['metrics_save_path']}")
+
+    return metrics, y_true, y_pred_proba
+
+
+# ─────────────────────────────────────────────
+# PLOTS
+# ─────────────────────────────────────────────
+
+def plot_training(history, fine_tune_history=None):
+    """Plot accuracy/loss curves for both training phases."""
+    acc  = history.history["accuracy"]
+    val  = history.history["val_accuracy"]
+    loss = history.history["loss"]
+    vloss= history.history["val_loss"]
+
+    if fine_tune_history:
+        acc  += fine_tune_history.history["accuracy"]
+        val  += fine_tune_history.history["val_accuracy"]
+        loss += fine_tune_history.history["loss"]
+        vloss+= fine_tune_history.history["val_loss"]
+
+    epochs     = range(1, len(acc) + 1)
+    fine_start = len(history.history["accuracy"]) if fine_tune_history else None
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    fig.suptitle("Eye Screening CNN — Training Curves", fontsize=14, fontweight="bold")
+
+    for ax, metric, val_metric, title in zip(
+        axes,
+        [acc, loss],
+        [val, vloss],
+        ["Accuracy", "Loss"],
+    ):
+        ax.plot(epochs, metric,     label=f"Train {title}", linewidth=2)
+        ax.plot(epochs, val_metric, label=f"Val {title}",   linewidth=2, linestyle="--")
+        if fine_start:
+            ax.axvline(fine_start, color="red", linestyle=":", label="Fine-tune start")
+        ax.set_xlabel("Epoch")
+        ax.set_title(title)
+        ax.legend()
+        ax.grid(alpha=0.3)
+
+    plt.tight_layout()
+    out = os.path.join(CONFIG["model_dir"], "training_curves.png")
+    plt.savefig(out, dpi=150)
+    print(f"Training curves saved → {out}")
+
+
+def plot_roc(y_true, y_pred_proba):
+    fpr, tpr, _ = roc_curve(y_true, y_pred_proba[:, 1])
+    auc = roc_auc_score(y_true, y_pred_proba[:, 1])
+
+    plt.figure(figsize=(7, 6))
+    plt.plot(fpr, tpr, linewidth=2.5, label=f"AUC = {auc:.3f}", color="#2196F3")
+    plt.plot([0, 1], [0, 1], "k--", linewidth=1)
+    plt.xlabel("False Positive Rate (1 – Specificity)")
+    plt.ylabel("True Positive Rate (Sensitivity)")
+    plt.title("ROC Curve — Eye Screening Model")
+    plt.legend(loc="lower right")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    out = os.path.join(CONFIG["model_dir"], "roc_curve.png")
+    plt.savefig(out, dpi=150)
+    print(f"ROC curve saved → {out}")
+
+
+# ─────────────────────────────────────────────
+# INFERENCE
+# ─────────────────────────────────────────────
+
+def load_model(path: str = None) -> tf.keras.Model:
+    path = path or CONFIG["ft_save_path"]
+    print(f"Loading model from {path}")
+    return tf.keras.models.load_model(path)
+
+
+def predict_single(model: tf.keras.Model, image_path: str) -> dict:
+    """
+    Predict a single fundus image.
+    Uses tf.keras.utils (non-deprecated) API.
+    Returns: { label, confidence, normal_prob, referral_prob, referral_needed }
+    """
+    img = tf.keras.utils.load_img(image_path, target_size=CONFIG["image_size"])
+    arr = tf.keras.utils.img_to_array(img)          # still in [0, 255] range —
+    arr = np.expand_dims(arr, axis=0)               # backbone preprocess is inside model
+    proba = model.predict(arr, verbose=0)[0]
+    idx   = int(np.argmax(proba))
+    return {
+        "label":         CONFIG["class_names"][idx],
+        "confidence":    round(float(proba[idx]) * 100, 2),
+        "normal_prob":   round(float(proba[0])   * 100, 2),
+        "referral_prob": round(float(proba[1])   * 100, 2),
+        "referral_needed": idx == 1,
+    }
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Eye Screening CNN")
+    parser.add_argument("--train_dir", default="data/train")
+    parser.add_argument("--val_dir",   default="data/val")
+    parser.add_argument("--test_dir",  default="data/test")
+    parser.add_argument("--predict",   default=None,
+                        help="Path to a single fundus image for inference")
+    args = parser.parse_args()
+
+    if args.predict:
+        model  = load_model()
+        result = predict_single(model, args.predict)
+        print(f"\nResult for: {args.predict}")
+        print(f"  Label      : {result['label']}")
+        print(f"  Confidence : {result['confidence']}%")
+        print(f"  Referral?  : {'YES ⚠️' if result['referral_needed'] else 'No ✓'}")
+    else:
+        model, history, ft_history = train(args.train_dir, args.val_dir, args.test_dir)
+
+        # Build a clean, shuffle=False test generator for evaluation
+        test_datagen  = ImageDataGenerator(rescale=1.0)
+        test_gen_eval = test_datagen.flow_from_directory(
+            args.test_dir,
+            target_size=CONFIG["image_size"],
+            batch_size=CONFIG["batch_size"],
+            class_mode="categorical",
+            shuffle=False,
+        )
+
+        metrics, y_true, y_pred_proba = evaluate(model, test_gen_eval)
+        plot_training(history, ft_history)
+        plot_roc(y_true, y_pred_proba)
